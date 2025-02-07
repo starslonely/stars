@@ -1,0 +1,491 @@
+import asyncio
+import logging
+from aiogram import Bot, Dispatcher, types
+from aiogram.enums import ParseMode
+from aiogram.filters import Command
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.utils.token import TokenValidationError
+import sqlite3
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Инициализация бота и диспетчера
+API_TOKEN = '8086883247:AAGJFU9l44ZaA0noRX3QPAbtpxTFuzkSh0M'
+bot = Bot(token=API_TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+
+# Подключение к базе данных SQLite
+conn = sqlite3.connect("bot_database.db", check_same_thread=False)
+cursor = conn.cursor()
+
+# Создание таблиц
+cursor.execute(
+    """
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER UNIQUE,
+        username TEXT,
+        invited_by INTEGER,
+        stars REAL DEFAULT 0,
+        bonus_given INTEGER DEFAULT 0  -- Новое поле для отслеживания начисления бонуса
+    )
+    """
+)
+
+cursor.execute(
+    """
+    CREATE TABLE IF NOT EXISTS channels (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        channel_id TEXT UNIQUE,
+        channel_url TEXT,
+        button_name TEXT  -- Новое поле для названия кнопки
+    )
+    """
+)
+
+conn.commit()
+
+# Состояния для FSM
+class Form(StatesGroup):
+    withdraw_amount = State()
+    broadcast_message = State()
+    add_channel_id = State()
+    add_channel_url = State()
+    add_channel_button_name = State()  # Новое состояние для названия кнопки
+    remove_channel = State()
+
+# Функция для создания клавиатуры главного меню
+def get_main_menu_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        types.InlineKeyboardButton(text="⭐️ Заработать", callback_data="get_stars"),
+        types.InlineKeyboardButton(text="⭐️ Вывести", callback_data="withdraw_stars"),
+    )
+    builder.row(types.InlineKeyboardButton(text="📊 Статистика", callback_data="stats"))
+    return builder.as_markup()
+
+# Функция для показа главного меню
+async def show_main_menu(message: types.Message):
+    await message.answer(
+        "⭐️ <b>Lonely Stars</b> - <i> бот, который позволит вам заработать звезды, приглашая людей.</i>\n\n<b>Выберите действие:</b>",
+        reply_markup=get_main_menu_keyboard(),
+        parse_mode="HTML"
+    )
+
+# Команда /start
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    user_id = message.from_user.id
+    username = message.from_user.username
+
+    # Проверка, зарегистрирован ли пользователь
+    cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+    user = cursor.fetchone()
+
+    if not user:
+        # Регистрация нового пользователя
+        cursor.execute(
+            "INSERT INTO users (user_id, username) VALUES (?, ?)",
+            (user_id, username),
+        )
+        conn.commit()
+
+        # Если есть реферальный код в сообщении
+        if len(message.text.split()) > 1:
+            referrer_id = int(message.text.split()[1])  # Получаем user_id пригласившего
+            cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (referrer_id,))
+            referrer = cursor.fetchone()
+            if referrer:
+                # Сохраняем реферала в базе данных, но пока не начисляем звезды
+                cursor.execute("UPDATE users SET invited_by = ? WHERE user_id = ?", (referrer_id, user_id))
+                conn.commit()
+
+    # Проверка подписки на каналы
+    cursor.execute("SELECT channel_id, channel_url, button_name FROM channels")
+    channels = cursor.fetchall()
+
+    if not channels:
+        # Если каналов нет, сразу показываем главное меню
+        await show_main_menu(message)
+        return
+
+    # Проверяем, подписан ли пользователь на все каналы
+    all_subscribed = True
+    for channel in channels:
+        channel_id = channel[0]
+        try:
+            chat_member = await bot.get_chat_member(channel_id, user_id)
+            if chat_member.status not in ["member", "administrator", "creator"]:
+                all_subscribed = False
+                break
+        except Exception as e:
+            logger.error(f"Ошибка при проверке подписки на канал {channel_id}: {e}")
+            all_subscribed = False
+            break
+
+    if all_subscribed:
+        # Если пользователь подписан на все каналы, показываем главное меню
+        await show_main_menu(message)
+    else:
+        # Если пользователь не подписан хотя бы на один канал, отправляем сообщение с просьбой подписаться
+        keyboard = InlineKeyboardBuilder()
+        for channel in channels:
+            button_name = channel[2]  # Используем название кнопки из базы данных
+            keyboard.row(types.InlineKeyboardButton(text=button_name, url=channel[1]))
+        keyboard.row(types.InlineKeyboardButton(text="Проверить подписку", callback_data="check_subscription"))
+
+        await message.answer(
+            "Пожалуйста, подпишитесь на следующие каналы, чтобы продолжить:",
+            reply_markup=keyboard.as_markup()
+        )
+
+# Обработка callback-запроса "Проверить подписку"
+@dp.callback_query(lambda c: c.data == "check_subscription")
+async def process_callback_check_subscription(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+
+    # Проверка подписки на каналы
+    cursor.execute("SELECT channel_id, channel_url, button_name FROM channels")
+    channels = cursor.fetchall()
+    all_subscribed = True  # Флаг для проверки подписки на все каналы
+
+    for channel in channels:
+        channel_id = channel[0]
+        try:
+            chat_member = await bot.get_chat_member(channel_id, user_id)
+            if chat_member.status not in ["member", "administrator", "creator"]:
+                all_subscribed = False
+                break
+        except Exception as e:
+            logger.error(f"Ошибка при проверке подписки на канал {channel_id}: {e}")
+            all_subscribed = False
+            break
+
+    if all_subscribed:
+        # Если пользователь подписан на все каналы, показываем главное меню
+        await show_main_menu(callback_query.message)
+
+        # Проверяем, был ли уже начислен бонус пригласившему
+        cursor.execute("SELECT invited_by, bonus_given FROM users WHERE user_id = ?", (user_id,))
+        result = cursor.fetchone()
+        referrer_id = result[0]
+        bonus_given = result[1]
+
+        if referrer_id and not bonus_given:
+            # Начисляем бонус пригласившему
+            cursor.execute("UPDATE users SET stars = stars + 0.5 WHERE user_id = ?", (referrer_id,))
+            # Устанавливаем флаг, что бонус был начислен
+            cursor.execute("UPDATE users SET bonus_given = 1 WHERE user_id = ?", (user_id,))
+            conn.commit()
+
+            # Отправка сообщения пригласившему
+            await bot.send_message(
+                referrer_id,
+                f"🎉 По вашей ссылке зарегистрировался новый пользователь: @{callback_query.from_user.username}! Вам начислено 0.5 звезд.",
+            )
+    else:
+        # Если пользователь не подписан на все каналы, отправляем сообщение с просьбой подписаться
+        keyboard = InlineKeyboardBuilder()
+        for channel in channels:
+            button_name = channel[2]  # Используем название кнопки из базы данных
+            keyboard.row(types.InlineKeyboardButton(text=button_name, url=channel[1]))
+        keyboard.row(types.InlineKeyboardButton(text="Проверить подписку", callback_data="check_subscription"))
+
+        await callback_query.answer(
+            "Вы не подписаны на все каналы. Пожалуйста, подпишитесь и нажмите кнопку 'Проверить подписку':",
+            reply_markup=keyboard.as_markup()
+        )
+
+# Обработка callback-запросов
+@dp.callback_query(lambda c: c.data == "get_stars")
+async def process_callback_get_stars(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+
+    # Получаем текущий баланс пользователя
+    cursor.execute("SELECT stars FROM users WHERE user_id = ?", (user_id,))
+    stars = cursor.fetchone()[0]
+
+    # Формируем реферальную ссылку
+    bot_username = (await bot.get_me()).username  # Получаем имя бота
+    referral_link = f"https://t.me/{bot_username}?start={user_id}"
+
+    # Добавляем кнопку "Назад"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Назад", callback_data="main_menu")]])
+
+    await callback_query.answer()
+    await callback_query.message.edit_text(
+        f"<b>⭐️ Зарабатывайте звезды, приглашая людей по вашей реферальной ссылке. \n\n └┬🔗 Ваша ссылка: <code>{referral_link}</code>\n └┬⭐️ Ваш текущий баланс: <code>{stars}</code> звезд.</b>",
+        reply_markup=keyboard,
+        parse_mode="HTML"
+    )
+
+@dp.callback_query(lambda c: c.data == "withdraw_stars")
+async def process_callback_withdraw_stars(callback_query: types.CallbackQuery, state: FSMContext):
+    user_id = callback_query.from_user.id
+
+    cursor.execute("SELECT stars FROM users WHERE user_id = ?", (user_id,))
+    stars = cursor.fetchone()[0]
+
+    if stars < 50:
+        await callback_query.answer("Минимальная сумма для вывода 50 звезд.", show_alert=True)
+    else:
+        # Добавляем кнопку "Назад"
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Назад", callback_data="main_menu")]])
+
+        await callback_query.answer()
+        await callback_query.message.edit_text("Введите количество звезд для вывода:", reply_markup=keyboard)
+        await state.set_state(Form.withdraw_amount)
+
+@dp.message(Form.withdraw_amount)
+async def process_withdraw_amount(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    username = message.from_user.username
+
+    try:
+        withdraw_amount = float(message.text)
+        cursor.execute("SELECT stars FROM users WHERE user_id = ?", (user_id,))
+        stars = cursor.fetchone()[0]
+
+        if withdraw_amount > stars:
+            await message.reply("У вас недостаточно звезд для вывода.")
+        else:
+            cursor.execute("UPDATE users SET stars = stars - ? WHERE user_id = ?", (withdraw_amount, user_id))
+            conn.commit()
+
+            # Отправка сообщения админу с кнопкой "выведено"
+            admin_id = 5441539026  # Замените на ваш ID
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Выведено", callback_data=f"withdrawn_{user_id}_{withdraw_amount}")]])
+            await bot.send_message(
+                admin_id,
+                f"Пользователь @{username} (ID: {user_id}) вывел {withdraw_amount} звезд.",
+                reply_markup=keyboard
+            )
+
+            await message.reply(f"<b>✅ Вы успешно создали заявку на вывод {withdraw_amount} звезд.</b> \n\n⭐️<i> Ожидайте поступления звезд на ваш баланс.</i>", parse_mode="HTML")
+    except ValueError:
+        await message.reply("Пожалуйста, введите корректное число.")
+
+    await state.clear()
+
+@dp.callback_query(lambda c: c.data.startswith("withdrawn_"))
+async def process_callback_withdrawn(callback_query: types.CallbackQuery):
+    data = callback_query.data.split("_")
+    user_id = int(data[1])
+    withdraw_amount = float(data[2])
+
+    # Удаляем сообщение админу
+    await callback_query.message.delete()
+
+    # Отправляем уведомление пользователю
+    await bot.send_message(user_id, f"<b>⭐️ Вы успешно вывели {withdraw_amount} звезд.</b>", parse_mode="HTML")
+
+@dp.callback_query(lambda c: c.data == "stats")
+async def process_callback_stats(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+
+    bot_username = (await bot.get_me()).username  # Получаем имя бота
+    referral_link = f"https://t.me/{bot_username}?start={user_id}"
+
+    cursor.execute(
+        "SELECT stars, (SELECT COUNT(*) FROM users WHERE invited_by = ?) FROM users WHERE user_id = ?",
+        (user_id, user_id),
+    )
+    stats = cursor.fetchone()
+
+    # Добавляем кнопку "Назад"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Назад", callback_data="main_menu")]])
+
+    await callback_query.answer()
+    await callback_query.message.edit_text(
+        f"<b>📊 Ваша статистика:</b>\n\n"
+        f"┌🌐 <b>Cсылка:</b> <code>{referral_link}</code>\n"
+        f"└┬👥 <b>Рефералы</b>\n"
+        f"  └┬👤 <b>Количество рефералов</b>: <code>{stats[1]}</code>\n"
+        f"  └┬⭐️ <b>Заработано звезд:</b> <code>{stats[1] * 0.6}</code>",
+        reply_markup=keyboard,
+        parse_mode="HTML"
+    )
+
+# Обработка callback-запроса "Назад"
+@dp.callback_query(lambda c: c.data == "main_menu")
+async def process_callback_main_menu(callback_query: types.CallbackQuery):
+    await callback_query.answer()
+    await callback_query.message.edit_text(
+        "⭐️ <b>Lonely Stars</b> - <i> бот, который позволит вам заработать звезды, приглашая людей.</i>\n\n<b>Выберите действие:</b>",
+        reply_markup=get_main_menu_keyboard(),
+        parse_mode="HTML"
+    )
+
+# Админ панель
+@dp.message(Command("admin"))
+async def cmd_admin(message: types.Message):
+    user_id = message.from_user.id
+    if user_id != 5441539026:  # Замените на ваш ID
+        await message.answer("У вас нет доступа к админ-панели.")
+        return
+
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        types.InlineKeyboardButton(text="Статистика", callback_data="admin_stats"),
+        types.InlineKeyboardButton(text="Рассылка", callback_data="admin_broadcast"),
+    )
+    builder.row(types.InlineKeyboardButton(text="Каналы", callback_data="admin_channels"))
+
+    await message.answer("Админ-панель:", reply_markup=builder.as_markup())
+
+# Обработка callback-запроса "Каналы"
+@dp.callback_query(lambda c: c.data == "admin_channels")
+async def process_callback_admin_channels(callback_query: types.CallbackQuery):
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        types.InlineKeyboardButton(text="Текущие каналы", callback_data="admin_current_channels"),
+        types.InlineKeyboardButton(text="Добавить канал", callback_data="admin_add_channel"),
+    )
+    builder.row(types.InlineKeyboardButton(text="Удалить канал", callback_data="admin_remove_channel"))
+
+    await callback_query.answer()
+    await callback_query.message.edit_text("Управление каналами:", reply_markup=builder.as_markup())
+
+# Обработка callback-запроса "Текущие каналы"
+@dp.callback_query(lambda c: c.data == "admin_current_channels")
+async def process_callback_admin_current_channels(callback_query: types.CallbackQuery):
+    cursor.execute("SELECT channel_id, channel_url, button_name FROM channels")
+    channels = cursor.fetchall()
+
+    if not channels:
+        await callback_query.answer("Нет добавленных каналов.")
+        return
+
+    builder = InlineKeyboardBuilder()
+    for channel in channels:
+        builder.row(types.InlineKeyboardButton(text=channel[2], callback_data=f"channel_info_{channel[0]}"))
+
+    await callback_query.answer()
+    await callback_query.message.edit_text("Текущие каналы:", reply_markup=builder.as_markup())
+
+# Обработка callback-запроса для отображения информации о канале
+@dp.callback_query(lambda c: c.data.startswith("channel_info_"))
+async def process_callback_channel_info(callback_query: types.CallbackQuery):
+    channel_id = callback_query.data.split("_")[2]
+    cursor.execute("SELECT channel_id, channel_url, button_name FROM channels WHERE channel_id = ?", (channel_id,))
+    channel = cursor.fetchone()
+
+    if channel:
+        await callback_query.answer()
+        await callback_query.message.edit_text(f"ID канала: {channel[0]}\nСсылка на канал: {channel[1]}\nНазвание кнопки: {channel[2]}")
+
+# Обработка callback-запроса "Добавить канал"
+@dp.callback_query(lambda c: c.data == "admin_add_channel")
+async def process_callback_admin_add_channel(callback_query: types.CallbackQuery, state: FSMContext):
+    await callback_query.answer()
+    await callback_query.message.edit_text("Введите ID канала:")
+    await state.set_state(Form.add_channel_id)
+
+@dp.message(Form.add_channel_id)
+async def process_add_channel_id(message: types.Message, state: FSMContext):
+    channel_id = message.text
+    await state.update_data(channel_id=channel_id)
+    await message.answer("Введите ссылку на канал:")
+    await state.set_state(Form.add_channel_url)
+
+@dp.message(Form.add_channel_url)
+async def process_add_channel_url(message: types.Message, state: FSMContext):
+    channel_url = message.text
+    await state.update_data(channel_url=channel_url)
+    await message.answer("Введите название кнопки для подписки:")
+    await state.set_state(Form.add_channel_button_name)
+
+@dp.message(Form.add_channel_button_name)
+async def process_add_channel_button_name(message: types.Message, state: FSMContext):
+    button_name = message.text
+    data = await state.get_data()
+    channel_id = data.get("channel_id")
+    channel_url = data.get("channel_url")
+
+    # Добавляем канал в базу данных с названием кнопки
+    cursor.execute(
+        "INSERT INTO channels (channel_id, channel_url, button_name) VALUES (?, ?, ?)",
+        (channel_id, channel_url, button_name),
+    )
+    conn.commit()
+
+    await message.answer(f"Канал {channel_url} с кнопкой '{button_name}' успешно добавлен.")
+    await state.clear()
+
+# Обработка callback-запроса "Удалить канал"
+@dp.callback_query(lambda c: c.data == "admin_remove_channel")
+async def process_callback_admin_remove_channel(callback_query: types.CallbackQuery):
+    cursor.execute("SELECT channel_id, channel_url, button_name FROM channels")
+    channels = cursor.fetchall()
+
+    if not channels:
+        await callback_query.answer("Нет добавленных каналов.")
+        return
+
+    builder = InlineKeyboardBuilder()
+    for channel in channels:
+        builder.row(types.InlineKeyboardButton(text=channel[2], callback_data=f"remove_channel_{channel[0]}"))
+
+    await callback_query.answer()
+    await callback_query.message.edit_text("Выберите канал для удаления:", reply_markup=builder.as_markup())
+
+# Обработка callback-запроса для удаления канала
+@dp.callback_query(lambda c: c.data.startswith("remove_channel_"))
+async def process_callback_remove_channel(callback_query: types.CallbackQuery):
+    channel_id = callback_query.data.split("_")[2]
+    cursor.execute("DELETE FROM channels WHERE channel_id = ?", (channel_id,))
+    conn.commit()
+
+    await callback_query.answer("Канал успешно удален.")
+    await callback_query.message.edit_text("Канал успешно удален.")
+
+# Обработка callback-запроса "Статистика"
+@dp.callback_query(lambda c: c.data == "admin_stats")
+async def process_callback_admin_stats(callback_query: types.CallbackQuery):
+    cursor.execute("SELECT COUNT(*) FROM users")
+    total_users = cursor.fetchone()[0]
+
+    cursor.execute("SELECT SUM(stars) FROM users")
+    total_stars = cursor.fetchone()[0] or 0
+
+    await callback_query.answer()
+    await callback_query.message.edit_text(
+        f"Общее количество пользователей: {total_users}\nОбщее количество звезд: {total_stars}"
+    )
+
+# Обработка callback-запроса "Рассылка"
+@dp.callback_query(lambda c: c.data == "admin_broadcast")
+async def process_callback_admin_broadcast(callback_query: types.CallbackQuery, state: FSMContext):
+    await callback_query.answer()
+    await callback_query.message.edit_text("Введите текст для рассылки:")
+    await state.set_state(Form.broadcast_message)
+
+@dp.message(Form.broadcast_message)
+async def process_broadcast_message(message: types.Message, state: FSMContext):
+    broadcast_text = message.text
+
+    cursor.execute("SELECT user_id FROM users")
+    users = cursor.fetchall()
+
+    for user in users:
+        try:
+            await bot.send_message(user[0], broadcast_text)
+        except Exception as e:
+            logger.error(f"Ошибка при отправке сообщения пользователю {user[0]}: {e}")
+
+    await message.answer("Рассылка завершена.")
+    await state.clear()
+
+# Запуск бота
+async def main():
+    await dp.start_polling(bot, skip_updates=True)
+
+if __name__ == "__main__":
+    asyncio.run(main())
